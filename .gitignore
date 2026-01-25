@@ -66,3 +66,9 @@ models/
 # Temporary files
 tmp/
 temp/
+
+# Claude Code
+.claude/
+
+# PDF files (reference documents)
+*.pdf
