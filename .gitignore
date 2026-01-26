@@ -57,7 +57,9 @@ docker/data/
 
 # Logs
 *.log
-logs/
+logs/*.log
+# Keep markdown work logs
+!logs/*.md
 
 # Model cache
 .cache/
