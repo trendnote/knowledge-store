@@ -1,0 +1,242 @@
+# Knowledge Store Layer - Docker Compose Configuration
+# =============================================================================
+# This configuration provides all required infrastructure services for the
+# Knowledge Store Layer including PostgreSQL, Milvus (with etcd/MinIO), Neo4j, and Kafka.
+#
+# Usage:
+#   cd docker
+#   docker compose up -d           # Start all services
+#   docker compose ps              # Check service status
+#   docker compose down            # Stop all services
+#   docker compose down -v         # Stop and remove volumes (data loss!)
+#
+# Ports:
+#   - PostgreSQL: 5432
+#   - Milvus: 19530 (gRPC), 9091 (health)
+#   - Neo4j: 7474 (HTTP), 7687 (Bolt)
+#   - Kafka: 9092
+#   - MinIO: 9000 (API), 9001 (Console)
+# =============================================================================
+
+services:
+  # ===========================================================================
+  # PostgreSQL - Relational Database for Metadata, ACL, Audit
+  # ===========================================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: knowledge-store-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-knowledge_store}
+      POSTGRES_USER: ${POSTGRES_USER:-ks_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ks_password}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ks_user} -d ${POSTGRES_DB:-knowledge_store}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - knowledge-store-network
+
+  # ===========================================================================
+  # etcd - Distributed Key-Value Store (Milvus Dependency)
+  # ===========================================================================
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: knowledge-store-etcd
+    restart: unless-stopped
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command:
+      - etcd
+      - --advertise-client-urls=http://127.0.0.1:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --data-dir=/etcd
+    volumes:
+      - etcd_data:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 30s
+    networks:
+      - knowledge-store-network
+
+  # ===========================================================================
+  # MinIO - Object Storage (Milvus Dependency)
+  # ===========================================================================
+  minio:
+    image: minio/minio:RELEASE.2023-09-04T19-57-37Z
+    container_name: knowledge-store-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    command: minio server /data --console-address ":9001"
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 30s
+    networks:
+      - knowledge-store-network
+
+  # ===========================================================================
+  # Milvus - Vector Database for Dense/Sparse Embeddings
+  # ===========================================================================
+  milvus:
+    image: milvusdb/milvus:v2.5.0
+    container_name: knowledge-store-milvus
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "${MILVUS_PORT:-19530}:19530"
+      - "${MILVUS_HEALTH_PORT:-9091}:9091"
+    volumes:
+      - milvus_data:/var/lib/milvus
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 90s
+    networks:
+      - knowledge-store-network
+
+  # ===========================================================================
+  # Neo4j - Graph Database for Knowledge Relationships
+  # ===========================================================================
+  neo4j:
+    image: neo4j:5.15-community
+    container_name: knowledge-store-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-neo4j_password}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_apoc_import_file_use__neo4j__config: "true"
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+      NEO4J_dbms_security_procedures_allowlist: apoc.*
+      # Memory settings (adjust based on available resources)
+      NEO4J_dbms_memory_heap_initial__size: 512m
+      NEO4J_dbms_memory_heap_max__size: 1G
+      NEO4J_dbms_memory_pagecache_size: 512m
+    ports:
+      - "${NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NEO4J_BOLT_PORT:-7687}:7687"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_plugins:/plugins
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - knowledge-store-network
+
+  # ===========================================================================
+  # Kafka - Event Streaming for Document Synchronization
+  # Using KRaft mode (no Zookeeper required) with Confluent Platform
+  # ===========================================================================
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: knowledge-store-kafka
+    restart: unless-stopped
+    environment:
+      # KRaft Configuration
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Listener Configuration
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:${KAFKA_PORT:-9092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Cluster Settings
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      # General Settings
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Log Retention
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      # Log directories
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports:
+      - "${KAFKA_PORT:-9092}:9094"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - knowledge-store-network
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  knowledge-store-network:
+    driver: bridge
+    name: knowledge-store-network
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  postgres_data:
+    name: knowledge-store-postgres-data
+  etcd_data:
+    name: knowledge-store-etcd-data
+  minio_data:
+    name: knowledge-store-minio-data
+  milvus_data:
+    name: knowledge-store-milvus-data
+  neo4j_data:
+    name: knowledge-store-neo4j-data
+  neo4j_logs:
+    name: knowledge-store-neo4j-logs
+  neo4j_plugins:
+    name: knowledge-store-neo4j-plugins
+  kafka_data:
+    name: knowledge-store-kafka-data
