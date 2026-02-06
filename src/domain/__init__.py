@@ -6,9 +6,12 @@ This module exports core domain entities:
 - Chunk: Document chunks
 - AclEntry: Access control
 - AuditLog: Audit trail
+- MilvusChunk: Vector chunk for Milvus
+- SearchHit: Search result
 """
 
 from src.domain.document import AclEntry, AuditLog, Chunk, Document, DocumentVersion
+from src.domain.search import MilvusChunk, SearchHit
 
 __all__ = [
     "Document",
@@ -16,4 +19,6 @@ __all__ = [
     "Chunk",
     "AclEntry",
     "AuditLog",
+    "MilvusChunk",
+    "SearchHit",
 ]
