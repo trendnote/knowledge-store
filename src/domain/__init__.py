@@ -8,9 +8,14 @@ This module exports core domain entities:
 - AuditLog: Audit trail
 - MilvusChunk: Vector chunk for Milvus
 - SearchHit: Search result
+- DocumentNode: Graph document node
+- ChunkNode: Graph chunk node
+- Entity: Entity mentioned in chunks
+- GraphSearchResult: Graph search result
 """
 
 from src.domain.document import AclEntry, AuditLog, Chunk, Document, DocumentVersion
+from src.domain.graph import ChunkNode, DocumentNode, Entity, GraphSearchResult
 from src.domain.search import MilvusChunk, SearchHit
 
 __all__ = [
@@ -21,4 +26,8 @@ __all__ = [
     "AuditLog",
     "MilvusChunk",
     "SearchHit",
+    "DocumentNode",
+    "ChunkNode",
+    "Entity",
+    "GraphSearchResult",
 ]
