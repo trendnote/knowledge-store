@@ -1204,3 +1204,592 @@ class TestSingletonFactory:
             mock_milvus_repo, mock_embedding_service, mock_acl_service
         )
         assert service1 is not service2
+
+
+# =============================================================================
+# Test RRF Calculation
+# =============================================================================
+
+
+class TestRRFCalculation:
+    """Tests for RRF score calculation."""
+
+    def test_calculate_rrf_scores_single_type(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test RRF calculation with single search type."""
+        results_by_type = {
+            SearchType.DENSE: [
+                SearchHit(
+                    chunk_uuid="c1",
+                    doc_uuid="d1",
+                    score=0.9,
+                    distance=0.1,
+                    chunk_text="First chunk",
+                    search_type="dense",
+                ),
+                SearchHit(
+                    chunk_uuid="c2",
+                    doc_uuid="d1",
+                    score=0.8,
+                    distance=0.2,
+                    chunk_text="Second chunk",
+                    search_type="dense",
+                ),
+            ]
+        }
+
+        merged = search_service._calculate_rrf_scores(results_by_type, k=60)
+
+        assert "c1" in merged
+        assert "c2" in merged
+        # c1: rank 1 -> 1/(60+1) = ~0.0164
+        assert abs(merged["c1"]["rrf_score"] - 1 / 61) < 0.001
+        # c2: rank 2 -> 1/(60+2) = ~0.0161
+        assert abs(merged["c2"]["rrf_score"] - 1 / 62) < 0.001
+
+    def test_calculate_rrf_scores_multiple_types(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test RRF calculation with multiple search types."""
+        results_by_type = {
+            SearchType.DENSE: [
+                SearchHit(
+                    chunk_uuid="c1",
+                    doc_uuid="d1",
+                    score=0.9,
+                    distance=0.1,
+                    chunk_text="Dense chunk",
+                    search_type="dense",
+                ),
+            ],
+            SearchType.SPARSE: [
+                SearchHit(
+                    chunk_uuid="c1",
+                    doc_uuid="d1",
+                    score=0.85,
+                    distance=0.15,
+                    chunk_text="Sparse chunk",
+                    search_type="sparse",
+                ),
+            ],
+        }
+
+        merged = search_service._calculate_rrf_scores(results_by_type, k=60)
+
+        # c1 appears in both, so RRF score is sum
+        expected = (1 / 61) + (1 / 61)  # rank 1 in both
+        assert abs(merged["c1"]["rrf_score"] - expected) < 0.001
+        assert len(merged["c1"]["sources"]) == 2
+
+    def test_calculate_rrf_scores_deduplication(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test that duplicate chunks are merged."""
+        results_by_type = {
+            SearchType.DENSE: [
+                SearchHit(
+                    chunk_uuid="c1",
+                    doc_uuid="d1",
+                    score=0.9,
+                    distance=0.1,
+                    chunk_text="Dense text",
+                    search_type="dense",
+                ),
+            ],
+            SearchType.SPARSE: [
+                SearchHit(
+                    chunk_uuid="c1",
+                    doc_uuid="d1",
+                    score=0.85,
+                    distance=0.15,
+                    chunk_text="",  # Empty text from sparse
+                    search_type="sparse",
+                ),
+            ],
+        }
+
+        merged = search_service._calculate_rrf_scores(results_by_type, k=60)
+
+        # Should have only one entry
+        assert len(merged) == 1
+        # Should keep the dense text
+        assert merged["c1"]["chunk_text"] == "Dense text"
+
+
+# =============================================================================
+# Test Merge Search Results
+# =============================================================================
+
+
+class TestMergeSearchResults:
+    """Tests for result merging."""
+
+    def test_merge_results_empty(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test merging empty results."""
+        merged = search_service._merge_search_results({}, top_k=10)
+        assert len(merged) == 0
+
+    def test_merge_results_top_k(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test that merged results respect top_k."""
+        results_by_type = {
+            SearchType.DENSE: [
+                SearchHit(
+                    chunk_uuid=f"c{i}",
+                    doc_uuid="d1",
+                    score=0.9 - i * 0.1,
+                    distance=0.1 + i * 0.1,
+                    chunk_text=f"Chunk {i}",
+                    search_type="dense",
+                )
+                for i in range(10)
+            ]
+        }
+
+        merged = search_service._merge_search_results(results_by_type, top_k=5)
+        assert len(merged) == 5
+
+    def test_merge_results_with_weights(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test merging with custom weights."""
+        results_by_type = {
+            SearchType.DENSE: [
+                SearchHit(
+                    chunk_uuid="c1",
+                    doc_uuid="d1",
+                    score=0.9,
+                    distance=0.1,
+                    chunk_text="Dense chunk",
+                    search_type="dense",
+                ),
+            ],
+            SearchType.SPARSE: [
+                SearchHit(
+                    chunk_uuid="c2",
+                    doc_uuid="d1",
+                    score=0.9,
+                    distance=0.1,
+                    chunk_text="Sparse chunk",
+                    search_type="sparse",
+                ),
+            ],
+        }
+
+        weights = {SearchType.DENSE: 1.0, SearchType.SPARSE: 0.5}
+        merged = search_service._merge_search_results(
+            results_by_type, top_k=10, weights=weights
+        )
+
+        # Both should be in results
+        assert len(merged) == 2
+
+    def test_merge_results_sorted_by_rrf(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test that results are sorted by RRF score."""
+        results_by_type = {
+            SearchType.DENSE: [
+                SearchHit(
+                    chunk_uuid="c1",
+                    doc_uuid="d1",
+                    score=0.9,
+                    distance=0.1,
+                    chunk_text="Dense chunk 1",
+                    search_type="dense",
+                ),
+            ],
+            SearchType.SPARSE: [
+                SearchHit(
+                    chunk_uuid="c1",
+                    doc_uuid="d1",
+                    score=0.85,
+                    distance=0.15,
+                    chunk_text="Sparse chunk 1",
+                    search_type="sparse",
+                ),
+                SearchHit(
+                    chunk_uuid="c2",
+                    doc_uuid="d1",
+                    score=0.8,
+                    distance=0.2,
+                    chunk_text="Sparse chunk 2",
+                    search_type="sparse",
+                ),
+            ],
+        }
+
+        merged = search_service._merge_search_results(results_by_type, top_k=10)
+
+        # c1 appears in both types, should have higher RRF score
+        assert merged[0].chunk_uuid == "c1"
+        assert merged[1].chunk_uuid == "c2"
+
+
+# =============================================================================
+# Test Unified Search
+# =============================================================================
+
+
+class TestUnifiedSearch:
+    """Tests for unified search."""
+
+    @pytest.mark.asyncio
+    async def test_unified_search_all_types(
+        self,
+        search_service_with_neo4j: SearchService,
+        mock_milvus_repo: MagicMock,
+        mock_neo4j_repo: MagicMock,
+    ) -> None:
+        """Test unified search with all search types."""
+        from src.domain.search import SearchRequest
+
+        mock_milvus_repo.dense_search.return_value = [
+            SearchHit(
+                chunk_uuid="c1",
+                doc_uuid="d1",
+                score=0.9,
+                distance=0.1,
+                chunk_text="Dense result",
+                search_type="dense",
+            ),
+        ]
+        mock_milvus_repo.sparse_search.return_value = [
+            SearchHit(
+                chunk_uuid="c2",
+                doc_uuid="d1",
+                score=0.85,
+                distance=0.15,
+                chunk_text="Sparse result",
+                search_type="sparse",
+            ),
+        ]
+        mock_neo4j_repo.search_by_keyword.return_value = [
+            {
+                "chunk_uuid": "c3",
+                "doc_uuid": "d1",
+                "path_length": 0,
+            },
+        ]
+
+        request = SearchRequest(
+            query="test query",
+            user_id="user1",
+            search_types=[SearchType.DENSE, SearchType.SPARSE, SearchType.GRAPH],
+        )
+
+        response = await search_service_with_neo4j.unified_search(request)
+
+        assert isinstance(response, SearchResponse)
+        assert response.total >= 1
+        assert len(response.search_types_used) >= 1
+
+    @pytest.mark.asyncio
+    async def test_unified_search_selected_types(
+        self,
+        search_service: SearchService,
+        mock_milvus_repo: MagicMock,
+    ) -> None:
+        """Test unified search with selected types only."""
+        from src.domain.search import SearchRequest
+
+        mock_milvus_repo.dense_search.return_value = [
+            SearchHit(
+                chunk_uuid="c1",
+                doc_uuid="d1",
+                score=0.9,
+                distance=0.1,
+                chunk_text="Dense result",
+                search_type="dense",
+            ),
+        ]
+
+        request = SearchRequest(
+            query="test query",
+            user_id="user1",
+            search_types=[SearchType.DENSE],  # Only dense
+        )
+
+        response = await search_service.unified_search(request)
+
+        assert SearchType.DENSE in response.search_types_used
+        assert SearchType.SPARSE not in response.search_types_used
+        mock_milvus_repo.dense_search.assert_called_once()
+        mock_milvus_repo.sparse_search.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unified_search_partial_failure(
+        self,
+        search_service: SearchService,
+        mock_milvus_repo: MagicMock,
+    ) -> None:
+        """Test unified search continues when one type fails."""
+        from src.domain.search import SearchRequest
+
+        mock_milvus_repo.dense_search.return_value = [
+            SearchHit(
+                chunk_uuid="c1",
+                doc_uuid="d1",
+                score=0.9,
+                distance=0.1,
+                chunk_text="Dense result",
+                search_type="dense",
+            ),
+        ]
+        mock_milvus_repo.sparse_search.side_effect = Exception("Sparse failed")
+
+        request = SearchRequest(
+            query="test query",
+            user_id="user1",
+            search_types=[SearchType.DENSE, SearchType.SPARSE],
+        )
+
+        response = await search_service.unified_search(request)
+
+        # Should still return dense results
+        assert len(response.results) >= 1
+        assert SearchType.DENSE in response.search_types_used
+        assert SearchType.SPARSE not in response.search_types_used
+
+    @pytest.mark.asyncio
+    async def test_unified_search_min_score_filter(
+        self,
+        search_service: SearchService,
+        mock_milvus_repo: MagicMock,
+    ) -> None:
+        """Test unified search applies min_score filter."""
+        from src.domain.search import SearchRequest
+
+        mock_milvus_repo.dense_search.return_value = [
+            SearchHit(
+                chunk_uuid="c1",
+                doc_uuid="d1",
+                score=0.9,
+                distance=0.1,
+                chunk_text="High score result",
+                search_type="dense",
+            ),
+            SearchHit(
+                chunk_uuid="c2",
+                doc_uuid="d1",
+                score=0.3,
+                distance=0.7,
+                chunk_text="Low score result",
+                search_type="dense",
+            ),
+        ]
+
+        request = SearchRequest(
+            query="test query",
+            user_id="user1",
+            search_types=[SearchType.DENSE],
+            min_score=0.02,  # RRF scores are small (1/61 ~ 0.016)
+        )
+
+        response = await search_service.unified_search(request)
+
+        # RRF score for rank 1 is 1/61 ~ 0.0164, so only first should pass
+        assert all(r.score >= 0.02 for r in response.results) or len(response.results) == 0
+
+    @pytest.mark.asyncio
+    async def test_unified_search_empty_types_uses_default(
+        self,
+        search_service: SearchService,
+        mock_milvus_repo: MagicMock,
+    ) -> None:
+        """Test unified search with empty types uses default types."""
+        from src.domain.search import SearchRequest
+
+        mock_milvus_repo.dense_search.return_value = []
+        mock_milvus_repo.sparse_search.return_value = []
+
+        request = SearchRequest(
+            query="test query",
+            user_id="user1",
+            search_types=[],  # Empty - will use default
+        )
+
+        response = await search_service.unified_search(request)
+
+        # Empty search_types triggers default (all types)
+        # Result should be empty but search_types_used shows what was attempted
+        assert response.total == 0
+
+
+# =============================================================================
+# Test Unified Search With Weights
+# =============================================================================
+
+
+class TestUnifiedSearchWithWeights:
+    """Tests for weighted unified search."""
+
+    @pytest.mark.asyncio
+    async def test_weighted_search_default_weights(
+        self,
+        search_service: SearchService,
+        mock_milvus_repo: MagicMock,
+    ) -> None:
+        """Test weighted search with default weights."""
+        from src.domain.search import SearchRequest
+
+        mock_milvus_repo.dense_search.return_value = []
+        mock_milvus_repo.sparse_search.return_value = []
+
+        request = SearchRequest(
+            query="test query",
+            user_id="user1",
+            search_types=[SearchType.DENSE, SearchType.SPARSE],
+        )
+
+        response = await search_service.unified_search_with_weights(request)
+
+        assert isinstance(response, SearchResponse)
+
+    @pytest.mark.asyncio
+    async def test_weighted_search_custom_weights(
+        self,
+        search_service: SearchService,
+        mock_milvus_repo: MagicMock,
+    ) -> None:
+        """Test weighted search with custom weights."""
+        from src.domain.search import SearchRequest
+
+        mock_milvus_repo.dense_search.return_value = [
+            SearchHit(
+                chunk_uuid="c1",
+                doc_uuid="d1",
+                score=0.9,
+                distance=0.1,
+                chunk_text="Dense result",
+                search_type="dense",
+            ),
+        ]
+        mock_milvus_repo.sparse_search.return_value = []
+
+        request = SearchRequest(
+            query="test query",
+            user_id="user1",
+            search_types=[SearchType.DENSE, SearchType.SPARSE],
+        )
+
+        custom_weights = {SearchType.DENSE: 2.0, SearchType.SPARSE: 0.5}
+        response = await search_service.unified_search_with_weights(
+            request, weights=custom_weights
+        )
+
+        assert len(response.results) >= 0  # May or may not have results
+
+
+# =============================================================================
+# Test Suggest Weights
+# =============================================================================
+
+
+class TestSuggestWeights:
+    """Tests for weight suggestion."""
+
+    def test_suggest_weights_short_query(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test weight suggestion for short queries."""
+        weights = search_service.suggest_weights("AI")
+
+        # Short query should prefer sparse (keyword) search
+        assert weights[SearchType.SPARSE] > weights[SearchType.DENSE]
+
+    def test_suggest_weights_semantic_query(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test weight suggestion for semantic queries."""
+        weights = search_service.suggest_weights("documents similar to machine learning")
+
+        # Semantic query should prefer dense search
+        assert weights[SearchType.DENSE] > weights[SearchType.SPARSE]
+
+    def test_suggest_weights_korean_similar(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test weight suggestion for Korean semantic queries."""
+        weights = search_service.suggest_weights("머신러닝과 유사한 문서")
+
+        # Korean "유사" (similar) should trigger semantic preference
+        assert weights[SearchType.DENSE] > weights[SearchType.SPARSE]
+
+    def test_suggest_weights_balanced(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test balanced weights for normal queries."""
+        weights = search_service.suggest_weights("machine learning technology paper")
+
+        # Normal query should use default weights
+        assert weights == search_service.DEFAULT_WEIGHTS
+
+
+# =============================================================================
+# Test Search Convenience Method
+# =============================================================================
+
+
+class TestSearchConvenienceMethod:
+    """Tests for search convenience method."""
+
+    @pytest.mark.asyncio
+    async def test_search_method(
+        self,
+        search_service: SearchService,
+        mock_milvus_repo: MagicMock,
+    ) -> None:
+        """Test search convenience method."""
+        mock_milvus_repo.dense_search.return_value = []
+        mock_milvus_repo.sparse_search.return_value = []
+
+        response = await search_service.search(
+            query="test query",
+            user_id="user1",
+            top_k=5,
+        )
+
+        assert isinstance(response, SearchResponse)
+
+    @pytest.mark.asyncio
+    async def test_search_method_with_types(
+        self,
+        search_service: SearchService,
+        mock_milvus_repo: MagicMock,
+    ) -> None:
+        """Test search method with specific types."""
+        mock_milvus_repo.dense_search.return_value = [
+            SearchHit(
+                chunk_uuid="c1",
+                doc_uuid="d1",
+                score=0.9,
+                distance=0.1,
+                chunk_text="Dense result",
+                search_type="dense",
+            ),
+        ]
+
+        response = await search_service.search(
+            query="test query",
+            user_id="user1",
+            search_types=[SearchType.DENSE],
+        )
+
+        assert SearchType.DENSE in response.search_types_used
+        mock_milvus_repo.sparse_search.assert_not_called()

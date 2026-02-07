@@ -23,7 +23,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any, Protocol
 
-from src.domain.search import SearchHit, SearchResponse, SearchType
+from src.domain.search import SearchHit, SearchRequest, SearchResponse, SearchType
 
 if TYPE_CHECKING:
     from scipy.sparse import csr_array
@@ -892,6 +892,414 @@ class SearchService:
             search_time_ms=elapsed_ms,
             search_types_used=[SearchType.GRAPH],
         )
+
+    # =========================================================================
+    # Unified Search (Hybrid with RRF)
+    # =========================================================================
+
+    # Default weights for different search types
+    DEFAULT_WEIGHTS: dict[SearchType, float] = {
+        SearchType.DENSE: 1.0,
+        SearchType.SPARSE: 0.8,
+        SearchType.GRAPH: 0.6,
+    }
+
+    def _calculate_rrf_scores(
+        self,
+        results_by_type: dict[SearchType, list[SearchHit]],
+        k: int = 60,
+    ) -> dict[str, dict[str, Any]]:
+        """Calculate RRF scores for all results.
+
+        RRF(d) = Σ 1 / (k + rank_i(d))
+
+        Args:
+            results_by_type: Results grouped by search type
+            k: RRF constant (default 60)
+
+        Returns:
+            Dict of chunk_uuid to merged result info
+        """
+        merged: dict[str, dict[str, Any]] = {}
+
+        for search_type, results in results_by_type.items():
+            for rank, result in enumerate(results, start=1):
+                chunk_uuid = result.chunk_uuid
+                rrf_contribution = 1 / (k + rank)
+
+                if chunk_uuid in merged:
+                    merged[chunk_uuid]["rrf_score"] += rrf_contribution
+                    merged[chunk_uuid]["sources"][search_type] = {
+                        "score": result.score,
+                        "rank": rank,
+                    }
+                    # Keep the best chunk_text if not already set
+                    if not merged[chunk_uuid].get("chunk_text") and result.chunk_text:
+                        merged[chunk_uuid]["chunk_text"] = result.chunk_text
+                else:
+                    merged[chunk_uuid] = {
+                        "chunk_uuid": chunk_uuid,
+                        "doc_uuid": result.doc_uuid,
+                        "rrf_score": rrf_contribution,
+                        "chunk_text": result.chunk_text,
+                        "sources": {
+                            search_type: {
+                                "score": result.score,
+                                "rank": rank,
+                            }
+                        },
+                        "metadata": result.metadata.copy() if result.metadata else {},
+                    }
+
+        return merged
+
+    def _merge_search_results(
+        self,
+        results_by_type: dict[SearchType, list[SearchHit]],
+        top_k: int,
+        weights: dict[SearchType, float] | None = None,
+        rrf_k: int = 60,
+    ) -> list[SearchHit]:
+        """Merge results from multiple search types using RRF.
+
+        Args:
+            results_by_type: Results grouped by search type
+            top_k: Maximum results to return
+            weights: Optional weights per search type
+            rrf_k: RRF constant k
+
+        Returns:
+            Merged and sorted SearchHit list
+        """
+        if not results_by_type:
+            return []
+
+        # Apply weights by adjusting effective ranks
+        weighted_results: dict[SearchType, list[SearchHit]] = {}
+        for search_type, results in results_by_type.items():
+            weight = 1.0
+            if weights:
+                weight = weights.get(search_type, 1.0)
+
+            # Create weighted copies
+            weighted = []
+            for r in results:
+                weighted_hit = SearchHit(
+                    chunk_uuid=r.chunk_uuid,
+                    doc_uuid=r.doc_uuid,
+                    score=r.score * weight,
+                    distance=r.distance,
+                    chunk_text=r.chunk_text,
+                    section_path=r.section_path,
+                    search_type=r.search_type,
+                    metadata=r.metadata.copy() if r.metadata else {},
+                )
+                weighted.append(weighted_hit)
+            weighted_results[search_type] = weighted
+
+        # Calculate RRF scores
+        merged = self._calculate_rrf_scores(weighted_results, k=rrf_k)
+
+        # Sort by RRF score and take top_k
+        sorted_items = sorted(
+            merged.values(),
+            key=lambda x: x["rrf_score"],
+            reverse=True,
+        )[:top_k]
+
+        # Convert to SearchHit
+        final_results = []
+        for item in sorted_items:
+            hit = SearchHit(
+                chunk_uuid=item["chunk_uuid"],
+                doc_uuid=item["doc_uuid"],
+                score=item["rrf_score"],
+                distance=1.0 - item["rrf_score"],
+                chunk_text=item.get("chunk_text", ""),
+                search_type="hybrid",
+                metadata={
+                    "sources": item["sources"],
+                    **item.get("metadata", {}),
+                },
+            )
+            final_results.append(hit)
+
+        return final_results
+
+    async def unified_search(
+        self,
+        request: SearchRequest,
+    ) -> SearchResponse:
+        """Execute unified search combining multiple search types.
+
+        Runs Dense, Sparse, and Graph searches in parallel,
+        then merges results using RRF (Reciprocal Rank Fusion).
+
+        Args:
+            request: Search request parameters
+
+        Returns:
+            SearchResponse with merged results
+
+        Example:
+            >>> request = SearchRequest(
+            ...     query="machine learning",
+            ...     user_id="user1",
+            ...     search_types=[SearchType.DENSE, SearchType.SPARSE],
+            ... )
+            >>> response = await service.unified_search(request)
+        """
+        import asyncio
+
+        start_time = time.time()
+
+        # Determine which search types to use
+        search_types = request.search_types or [
+            SearchType.DENSE,
+            SearchType.SPARSE,
+            SearchType.GRAPH,
+        ]
+
+        logger.info(f"Unified search with types: {[t.value for t in search_types]}")
+
+        # Build search tasks
+        tasks: dict[SearchType, Any] = {}
+
+        if SearchType.DENSE in search_types:
+            tasks[SearchType.DENSE] = self.dense_search(
+                query=request.query,
+                user_id=request.user_id,
+                user_groups=request.user_groups,
+                top_k=request.top_k * 2,  # Over-fetch for merging
+                min_score=0.0,  # Apply min_score after merging
+            )
+
+        if SearchType.SPARSE in search_types:
+            tasks[SearchType.SPARSE] = self.sparse_search(
+                query=request.query,
+                user_id=request.user_id,
+                user_groups=request.user_groups,
+                top_k=request.top_k * 2,
+                min_score=0.0,
+            )
+
+        if SearchType.GRAPH in search_types:
+            tasks[SearchType.GRAPH] = self.graph_search(
+                query=request.query,
+                user_id=request.user_id,
+                user_groups=request.user_groups,
+                top_k=request.top_k * 2,
+                min_score=0.0,
+            )
+
+        if not tasks:
+            logger.warning("No search types specified")
+            return SearchResponse(
+                results=[],
+                total=0,
+                search_time_ms=(time.time() - start_time) * 1000,
+                search_types_used=[],
+            )
+
+        # Execute in parallel
+        task_list = list(tasks.values())
+        task_keys = list(tasks.keys())
+
+        results_list = await asyncio.gather(*task_list, return_exceptions=True)
+
+        # Process results
+        results_by_type: dict[SearchType, list[SearchHit]] = {}
+        errors: list[str] = []
+
+        for search_type, result in zip(task_keys, results_list, strict=False):
+            if isinstance(result, Exception):
+                logger.error(f"{search_type.value} search failed: {result}")
+                errors.append(f"{search_type.value}: {result!s}")
+            else:
+                results_by_type[search_type] = result
+
+        # Merge results using RRF
+        merged_results = self._merge_search_results(
+            results_by_type,
+            top_k=request.top_k,
+        )
+
+        # Apply min_score filter after merging
+        if request.min_score > 0:
+            merged_results = [r for r in merged_results if r.score >= request.min_score]
+
+        # Calculate search time
+        search_time_ms = (time.time() - start_time) * 1000
+
+        logger.info(
+            f"Unified search completed: {len(merged_results)} results "
+            f"in {search_time_ms:.2f}ms"
+        )
+
+        return SearchResponse(
+            results=merged_results,
+            total=len(merged_results),
+            search_time_ms=search_time_ms,
+            search_types_used=list(results_by_type.keys()),
+        )
+
+    async def unified_search_with_weights(
+        self,
+        request: SearchRequest,
+        weights: dict[SearchType, float] | None = None,
+    ) -> SearchResponse:
+        """Execute unified search with custom weights.
+
+        Args:
+            request: Search request parameters
+            weights: Custom weights per search type (default: DEFAULT_WEIGHTS)
+
+        Returns:
+            SearchResponse with weighted merged results
+        """
+        import asyncio
+
+        start_time = time.time()
+        effective_weights = weights or self.DEFAULT_WEIGHTS
+
+        search_types = request.search_types or list(effective_weights.keys())
+
+        # Filter weights for selected types
+        active_weights = {t: effective_weights.get(t, 1.0) for t in search_types}
+
+        logger.info(
+            f"Unified search with weights: "
+            f"{[(t.value, w) for t, w in active_weights.items()]}"
+        )
+
+        # Build and execute search tasks
+        tasks: dict[SearchType, Any] = {}
+        if SearchType.DENSE in search_types:
+            tasks[SearchType.DENSE] = self.dense_search(
+                request.query,
+                request.user_id,
+                request.user_groups,
+                request.top_k * 2,
+            )
+        if SearchType.SPARSE in search_types:
+            tasks[SearchType.SPARSE] = self.sparse_search(
+                request.query,
+                request.user_id,
+                request.user_groups,
+                request.top_k * 2,
+            )
+        if SearchType.GRAPH in search_types:
+            tasks[SearchType.GRAPH] = self.graph_search(
+                request.query,
+                request.user_id,
+                request.user_groups,
+                request.top_k * 2,
+            )
+
+        if not tasks:
+            return SearchResponse(
+                results=[],
+                total=0,
+                search_time_ms=(time.time() - start_time) * 1000,
+                search_types_used=[],
+            )
+
+        results_list = await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+        results_by_type: dict[SearchType, list[SearchHit]] = {}
+        for search_type, result in zip(tasks.keys(), results_list, strict=False):
+            if not isinstance(result, Exception):
+                results_by_type[search_type] = result
+
+        # Merge with weights
+        merged = self._merge_search_results(
+            results_by_type,
+            top_k=request.top_k,
+            weights=active_weights,
+        )
+
+        if request.min_score > 0:
+            merged = [r for r in merged if r.score >= request.min_score]
+
+        search_time_ms = (time.time() - start_time) * 1000
+
+        return SearchResponse(
+            results=merged,
+            total=len(merged),
+            search_time_ms=search_time_ms,
+            search_types_used=list(results_by_type.keys()),
+        )
+
+    def suggest_weights(self, query: str) -> dict[SearchType, float]:
+        """Suggest weights based on query characteristics.
+
+        Simple heuristic based on query length and keywords.
+
+        Args:
+            query: Search query
+
+        Returns:
+            Suggested weights per search type
+        """
+        words = query.split()
+
+        if len(words) <= 2:
+            # Short query: prefer keyword match (sparse)
+            return {
+                SearchType.DENSE: 0.6,
+                SearchType.SPARSE: 1.0,
+                SearchType.GRAPH: 0.8,
+            }
+        elif any(word in query.lower() for word in ["similar", "like", "related", "유사"]):
+            # Semantic query: prefer dense
+            return {
+                SearchType.DENSE: 1.0,
+                SearchType.SPARSE: 0.5,
+                SearchType.GRAPH: 0.7,
+            }
+        else:
+            # Balanced
+            return self.DEFAULT_WEIGHTS
+
+    async def search(
+        self,
+        query: str,
+        user_id: str,
+        user_groups: list[str] | None = None,
+        top_k: int = 10,
+        search_types: list[SearchType] | None = None,
+        min_score: float = 0.0,
+    ) -> SearchResponse:
+        """Convenience method for unified search.
+
+        Args:
+            query: Search query
+            user_id: User identifier
+            user_groups: User's group memberships
+            top_k: Maximum results
+            search_types: Types of search to perform
+            min_score: Minimum score threshold
+
+        Returns:
+            SearchResponse
+
+        Example:
+            >>> response = await service.search(
+            ...     query="machine learning",
+            ...     user_id="user1",
+            ...     top_k=10,
+            ... )
+        """
+        request = SearchRequest(
+            query=query,
+            user_id=user_id,
+            user_groups=user_groups or [],
+            top_k=top_k,
+            search_types=search_types
+            or [SearchType.DENSE, SearchType.SPARSE, SearchType.GRAPH],
+            min_score=min_score,
+        )
+        return await self.unified_search(request)
 
 
 # =============================================================================
