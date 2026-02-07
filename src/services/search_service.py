@@ -186,6 +186,44 @@ class SearchService:
             return results
         return [r for r in results if r.score >= min_score]
 
+    def _preprocess_query(self, query: str) -> str:
+        """Preprocess query for better search.
+
+        Currently a passthrough - BGE-M3 handles Korean well.
+        Can be extended for:
+        - Query expansion
+        - Stop word removal
+        - Normalization
+
+        Args:
+            query: Raw query text
+
+        Returns:
+            Preprocessed query
+        """
+        # BGE-M3 handles Korean tokenization internally
+        # Just trim whitespace for now
+        return query.strip()
+
+    def _is_valid_sparse_vector(self, sparse_vector: Any) -> bool:
+        """Check if sparse vector is valid (non-empty).
+
+        Args:
+            sparse_vector: Sparse vector to validate
+
+        Returns:
+            True if valid, False otherwise
+        """
+        if sparse_vector is None:
+            return False
+        # Handle dict-like sparse vectors
+        if hasattr(sparse_vector, "__len__"):
+            return len(sparse_vector) > 0
+        # Handle scipy sparse arrays
+        if hasattr(sparse_vector, "nnz"):
+            return sparse_vector.nnz > 0
+        return True
+
     async def dense_search(
         self,
         query: str,
@@ -313,7 +351,8 @@ class SearchService:
     ) -> list[SearchHit]:
         """Execute sparse vector search (keyword matching).
 
-        Uses sparse embeddings for BM25-like keyword matching.
+        Uses inner product on sparse embeddings for BM25-style keyword matching.
+        BGE-M3 model handles Korean tokenization internally.
 
         Args:
             query: Search query text
@@ -325,20 +364,40 @@ class SearchService:
 
         Returns:
             List of search results sorted by relevance
+
+        Example:
+            >>> results = await service.sparse_search(
+            ...     query="인공지능 기술 문서",
+            ...     user_id="user1",
+            ...     user_groups=["team-ml"],
+            ...     top_k=10,
+            ... )
         """
         groups = user_groups or []
         start_time = time.time()
 
+        # 0. Preprocess query
+        processed_query = self._preprocess_query(query)
+        if not processed_query:
+            logger.warning("Empty query after preprocessing")
+            return []
+
         # 1. Get accessible documents
         doc_uuids = await self._get_accessible_doc_uuids(user_id, groups)
+        logger.debug(f"User {user_id} has access to {len(doc_uuids)} documents")
 
         # 2. Generate query embedding
-        embeddings = self._encode_query(query)
+        embeddings = self._encode_query(processed_query)
         if not embeddings or not embeddings.sparse:
             logger.warning("Failed to generate sparse query embedding")
             return []
 
         query_sparse = embeddings.sparse[0]
+
+        # Validate sparse vector is not empty
+        if not self._is_valid_sparse_vector(query_sparse):
+            logger.warning("Empty sparse embedding for query")
+            return []
 
         # 3. Execute search
         try:
@@ -361,6 +420,50 @@ class SearchService:
         )
 
         return results
+
+    async def sparse_search_with_response(
+        self,
+        query: str,
+        user_id: str,
+        user_groups: list[str] | None = None,
+        top_k: int = 10,
+        min_score: float = 0.0,
+        security_level: str | None = None,
+    ) -> SearchResponse:
+        """Execute sparse search and return SearchResponse.
+
+        Convenience method that wraps sparse_search with timing and metadata.
+
+        Args:
+            query: Search query text
+            user_id: User identifier for ACL
+            user_groups: User's group memberships
+            top_k: Maximum results to return
+            min_score: Minimum score threshold
+            security_level: Maximum security level for user
+
+        Returns:
+            SearchResponse with results and metadata
+        """
+        start_time = time.time()
+
+        results = await self.sparse_search(
+            query=query,
+            user_id=user_id,
+            user_groups=user_groups,
+            top_k=top_k,
+            min_score=min_score,
+            security_level=security_level,
+        )
+
+        elapsed_ms = (time.time() - start_time) * 1000
+
+        return SearchResponse(
+            results=results,
+            total=len(results),
+            search_time_ms=elapsed_ms,
+            search_types_used=[SearchType.SPARSE],
+        )
 
     async def hybrid_search(
         self,

@@ -31,9 +31,11 @@ def mock_milvus_repo() -> MagicMock:
 def mock_embedding_service() -> MagicMock:
     """Create mock embedding service."""
     service = MagicMock()
+    # Use a dict with content for sparse vector to pass validation
+    sparse_vector = {123: 0.5, 456: 0.8, 789: 0.3}
     service.encode.return_value = MagicMock(
         dense=[[0.1] * 1024],
-        sparse=[MagicMock()],
+        sparse=[sparse_vector],
     )
     return service
 
@@ -311,6 +313,37 @@ class TestDenseSearchWithResponse:
 # =============================================================================
 
 
+@pytest.fixture
+def sample_sparse_search_hits() -> list[SearchHit]:
+    """Create sample sparse search hits."""
+    return [
+        SearchHit(
+            chunk_uuid="chunk-s1",
+            doc_uuid="doc-1",
+            score=0.90,
+            distance=0.10,
+            chunk_text="키워드 매칭 결과",
+            search_type="sparse",
+        ),
+        SearchHit(
+            chunk_uuid="chunk-s2",
+            doc_uuid="doc-1",
+            score=0.75,
+            distance=0.25,
+            chunk_text="인공지능 기술 문서",
+            search_type="sparse",
+        ),
+        SearchHit(
+            chunk_uuid="chunk-s3",
+            doc_uuid="doc-2",
+            score=0.35,
+            distance=0.65,
+            chunk_text="낮은 점수 결과",
+            search_type="sparse",
+        ),
+    ]
+
+
 class TestSparseSearch:
     """Tests for sparse search."""
 
@@ -335,6 +368,45 @@ class TestSparseSearch:
         mock_milvus_repo.sparse_search.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_sparse_search_korean_query(
+        self,
+        search_service: SearchService,
+        mock_milvus_repo: MagicMock,
+        sample_sparse_search_hits: list[SearchHit],
+    ) -> None:
+        """Test sparse search with Korean query."""
+        mock_milvus_repo.sparse_search.return_value = sample_sparse_search_hits[:2]
+
+        results = await search_service.sparse_search(
+            query="인공지능 기술 문서",
+            user_id="user1",
+            user_groups=["group1"],
+        )
+
+        assert len(results) == 2
+        mock_milvus_repo.sparse_search.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_sparse_search_with_min_score(
+        self,
+        search_service: SearchService,
+        mock_milvus_repo: MagicMock,
+        sample_sparse_search_hits: list[SearchHit],
+    ) -> None:
+        """Test sparse search with minimum score filter."""
+        mock_milvus_repo.sparse_search.return_value = sample_sparse_search_hits
+
+        results = await search_service.sparse_search(
+            query="test query",
+            user_id="user1",
+            top_k=10,
+            min_score=0.5,
+        )
+
+        assert len(results) == 2
+        assert all(r.score >= 0.5 for r in results)
+
+    @pytest.mark.asyncio
     async def test_sparse_search_no_embedding_returns_empty(
         self,
         search_service: SearchService,
@@ -349,6 +421,201 @@ class TestSparseSearch:
         )
 
         assert len(results) == 0
+
+    @pytest.mark.asyncio
+    async def test_sparse_search_empty_sparse_vector(
+        self,
+        search_service: SearchService,
+        mock_embedding_service: MagicMock,
+    ) -> None:
+        """Test sparse search with empty sparse embedding."""
+        # Empty dict-like sparse vector
+        mock_embedding_service.encode.return_value = MagicMock(
+            dense=[[0.1] * 1024],
+            sparse=[{}],  # Empty sparse vector
+        )
+
+        results = await search_service.sparse_search(
+            query="test query",
+            user_id="user1",
+        )
+
+        assert len(results) == 0
+
+    @pytest.mark.asyncio
+    async def test_sparse_search_applies_acl_filter(
+        self,
+        search_service: SearchService,
+        mock_milvus_repo: MagicMock,
+        mock_acl_service: MagicMock,
+    ) -> None:
+        """Test that ACL filter is applied to sparse search."""
+        mock_milvus_repo.sparse_search.return_value = []
+
+        await search_service.sparse_search(
+            query="test query",
+            user_id="user1",
+            user_groups=["group1", "group2"],
+        )
+
+        mock_acl_service.get_accessible_documents.assert_called_once_with(
+            "user1", ["group1", "group2"]
+        )
+        call_kwargs = mock_milvus_repo.sparse_search.call_args.kwargs
+        assert call_kwargs["doc_uuids"] == ["doc-1", "doc-2"]
+
+    @pytest.mark.asyncio
+    async def test_sparse_search_with_security_level(
+        self,
+        search_service: SearchService,
+        mock_milvus_repo: MagicMock,
+    ) -> None:
+        """Test sparse search with security level filter."""
+        mock_milvus_repo.sparse_search.return_value = []
+
+        await search_service.sparse_search(
+            query="test query",
+            user_id="user1",
+            security_level="internal",
+        )
+
+        call_kwargs = mock_milvus_repo.sparse_search.call_args.kwargs
+        assert call_kwargs["security_level"] == "internal"
+
+    @pytest.mark.asyncio
+    async def test_sparse_search_exception_propagates(
+        self,
+        search_service: SearchService,
+        mock_milvus_repo: MagicMock,
+    ) -> None:
+        """Test that exceptions from Milvus propagate."""
+        mock_milvus_repo.sparse_search.side_effect = Exception("Connection failed")
+
+        with pytest.raises(Exception, match="Connection failed"):
+            await search_service.sparse_search(
+                query="test query",
+                user_id="user1",
+            )
+
+    @pytest.mark.asyncio
+    async def test_sparse_search_empty_query_returns_empty(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test that empty query returns empty results."""
+        results = await search_service.sparse_search(
+            query="   ",  # Whitespace only
+            user_id="user1",
+        )
+
+        assert len(results) == 0
+
+
+class TestSparseSearchWithResponse:
+    """Tests for sparse search with response wrapper."""
+
+    @pytest.mark.asyncio
+    async def test_returns_search_response(
+        self,
+        search_service: SearchService,
+        mock_milvus_repo: MagicMock,
+        sample_sparse_search_hits: list[SearchHit],
+    ) -> None:
+        """Test that SearchResponse is returned."""
+        mock_milvus_repo.sparse_search.return_value = sample_sparse_search_hits[:2]
+
+        response = await search_service.sparse_search_with_response(
+            query="키워드 검색",
+            user_id="user1",
+        )
+
+        assert isinstance(response, SearchResponse)
+        assert response.total == 2
+        assert len(response.results) == 2
+        assert SearchType.SPARSE in response.search_types_used
+        assert response.search_time_ms >= 0
+
+    @pytest.mark.asyncio
+    async def test_response_includes_sparse_type(
+        self,
+        search_service: SearchService,
+        mock_milvus_repo: MagicMock,
+    ) -> None:
+        """Test SearchResponse includes SPARSE search type."""
+        mock_milvus_repo.sparse_search.return_value = []
+
+        response = await search_service.sparse_search_with_response(
+            query="test query",
+            user_id="user1",
+        )
+
+        response_dict = response.to_dict()
+        assert response_dict["search_types_used"] == ["sparse"]
+
+
+# =============================================================================
+# Test Preprocess Query
+# =============================================================================
+
+
+class TestPreprocessQuery:
+    """Tests for query preprocessing."""
+
+    def test_preprocess_query_strips_whitespace(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test that query is stripped."""
+        result = search_service._preprocess_query("  test query  ")
+        assert result == "test query"
+
+    def test_preprocess_query_korean(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test Korean query preprocessing."""
+        result = search_service._preprocess_query("  한국어 쿼리  ")
+        assert result == "한국어 쿼리"
+
+    def test_preprocess_query_empty(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test empty query preprocessing."""
+        result = search_service._preprocess_query("   ")
+        assert result == ""
+
+
+# =============================================================================
+# Test Sparse Vector Validation
+# =============================================================================
+
+
+class TestSparseVectorValidation:
+    """Tests for sparse vector validation."""
+
+    def test_is_valid_sparse_vector_with_dict(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test validation with dict sparse vector."""
+        assert search_service._is_valid_sparse_vector({123: 0.5, 456: 0.8})
+        assert not search_service._is_valid_sparse_vector({})
+
+    def test_is_valid_sparse_vector_with_none(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test validation with None."""
+        assert not search_service._is_valid_sparse_vector(None)
+
+    def test_is_valid_sparse_vector_with_list(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test validation with list."""
+        assert search_service._is_valid_sparse_vector([0.1, 0.2])
+        assert not search_service._is_valid_sparse_vector([])
 
 
 # =============================================================================
