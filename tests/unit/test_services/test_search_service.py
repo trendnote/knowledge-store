@@ -1,5 +1,6 @@
 """Tests for search service."""
 
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -616,6 +617,402 @@ class TestSparseVectorValidation:
         """Test validation with list."""
         assert search_service._is_valid_sparse_vector([0.1, 0.2])
         assert not search_service._is_valid_sparse_vector([])
+
+
+# =============================================================================
+# Test Keyword Extraction
+# =============================================================================
+
+
+class TestKeywordExtraction:
+    """Tests for keyword extraction."""
+
+    def test_extract_keywords_english(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test keyword extraction for English."""
+        keywords = search_service._extract_keywords("Find the important documents")
+        assert "find" in keywords
+        assert "important" in keywords
+        assert "documents" in keywords
+        assert "the" not in keywords  # Stopword
+
+    def test_extract_keywords_korean(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test keyword extraction for Korean."""
+        keywords = search_service._extract_keywords("인공지능 기술 문서를 찾아주세요")
+        assert "인공지능" in keywords
+        assert "기술" in keywords
+        assert "찾아주세요" in keywords
+
+    def test_extract_keywords_removes_stopwords(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test that stopwords are removed."""
+        keywords = search_service._extract_keywords("the is are 의 를 을")
+        assert len(keywords) == 0
+
+    def test_extract_keywords_filters_short_tokens(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test that short tokens are filtered."""
+        keywords = search_service._extract_keywords("a b c longer")
+        assert "longer" in keywords
+        assert "a" not in keywords
+
+    def test_extract_primary_keyword(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test primary keyword extraction."""
+        keyword = search_service._extract_primary_keyword("AI technology documents")
+        # Should pick longest non-stopword
+        assert keyword in ["technology", "documents"]
+
+    def test_extract_primary_keyword_korean(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test primary keyword extraction for Korean."""
+        keyword = search_service._extract_primary_keyword("인공지능 연구")
+        assert keyword == "인공지능"
+
+    def test_extract_primary_keyword_empty_query(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test primary keyword extraction with empty-ish query."""
+        keyword = search_service._extract_primary_keyword("the a is")
+        assert keyword == "the a is"  # Returns original stripped query
+
+
+# =============================================================================
+# Test Graph Search
+# =============================================================================
+
+
+@pytest.fixture
+def mock_neo4j_repo() -> MagicMock:
+    """Create mock Neo4j repository."""
+    repo = MagicMock()
+    repo.search_by_keyword = AsyncMock()
+    repo.search_by_entity = AsyncMock()
+    repo.search_related = AsyncMock()
+    return repo
+
+
+@pytest.fixture
+def search_service_with_neo4j(
+    mock_milvus_repo: MagicMock,
+    mock_embedding_service: MagicMock,
+    mock_acl_service: MagicMock,
+    mock_neo4j_repo: MagicMock,
+) -> SearchService:
+    """Create search service with Neo4j mock."""
+    return SearchService(
+        mock_milvus_repo, mock_embedding_service, mock_acl_service, mock_neo4j_repo
+    )
+
+
+@pytest.fixture
+def sample_graph_hits() -> list[dict[str, Any]]:
+    """Create sample graph search hits."""
+    return [
+        {
+            "chunk_uuid": "chunk-g1",
+            "doc_uuid": "doc-1",
+            "text_preview": "Graph result 1",
+            "title": "Document 1",
+            "path_length": 0,
+        },
+        {
+            "chunk_uuid": "chunk-g2",
+            "doc_uuid": "doc-1",
+            "text_preview": "Graph result 2",
+            "title": "Document 1",
+            "path_length": 1,
+        },
+        {
+            "chunk_uuid": "chunk-g3",
+            "doc_uuid": "doc-2",
+            "text_preview": "Graph result 3",
+            "title": "Document 2",
+            "path_length": 2,
+        },
+    ]
+
+
+class TestGraphSearch:
+    """Tests for graph search."""
+
+    @pytest.mark.asyncio
+    async def test_graph_search_success(
+        self,
+        search_service_with_neo4j: SearchService,
+        mock_neo4j_repo: MagicMock,
+        sample_graph_hits: list[dict[str, Any]],
+    ) -> None:
+        """Test successful graph search."""
+        mock_neo4j_repo.search_by_keyword.return_value = sample_graph_hits[:2]
+
+        results = await search_service_with_neo4j.graph_search(
+            query="test keyword",
+            user_id="user1",
+            user_groups=["group1"],
+            top_k=10,
+        )
+
+        assert len(results) == 2
+        assert results[0].search_type == "graph"
+        mock_neo4j_repo.search_by_keyword.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_graph_search_no_neo4j_repo(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test graph search without Neo4j repo returns empty."""
+        results = await search_service.graph_search(
+            query="test",
+            user_id="user1",
+        )
+
+        assert len(results) == 0
+
+    @pytest.mark.asyncio
+    async def test_graph_search_no_accessible_docs(
+        self,
+        search_service_with_neo4j: SearchService,
+        mock_acl_service: MagicMock,
+    ) -> None:
+        """Test graph search with no accessible documents."""
+        mock_acl_service.get_accessible_documents.return_value = []
+
+        results = await search_service_with_neo4j.graph_search(
+            query="test",
+            user_id="user1",
+        )
+
+        assert len(results) == 0
+
+    @pytest.mark.asyncio
+    async def test_graph_search_scoring(
+        self,
+        search_service_with_neo4j: SearchService,
+        mock_neo4j_repo: MagicMock,
+        sample_graph_hits: list[dict[str, Any]],
+    ) -> None:
+        """Test graph search result scoring."""
+        mock_neo4j_repo.search_by_keyword.return_value = sample_graph_hits
+
+        results = await search_service_with_neo4j.graph_search(
+            query="test",
+            user_id="user1",
+        )
+
+        # First result should have highest score (position 0, path_length 0)
+        # Second result has position penalty + path penalty
+        assert results[0].score > results[1].score
+        assert results[1].score > results[2].score
+
+    @pytest.mark.asyncio
+    async def test_graph_search_with_min_score(
+        self,
+        search_service_with_neo4j: SearchService,
+        mock_neo4j_repo: MagicMock,
+        sample_graph_hits: list[dict[str, Any]],
+    ) -> None:
+        """Test graph search with minimum score filter."""
+        mock_neo4j_repo.search_by_keyword.return_value = sample_graph_hits
+
+        results = await search_service_with_neo4j.graph_search(
+            query="test",
+            user_id="user1",
+            min_score=0.8,
+        )
+
+        assert all(r.score >= 0.8 for r in results)
+
+    @pytest.mark.asyncio
+    async def test_graph_search_extracts_keyword(
+        self,
+        search_service_with_neo4j: SearchService,
+        mock_neo4j_repo: MagicMock,
+    ) -> None:
+        """Test that graph search extracts keyword from query."""
+        mock_neo4j_repo.search_by_keyword.return_value = []
+
+        await search_service_with_neo4j.graph_search(
+            query="machine learning algorithms",
+            user_id="user1",
+        )
+
+        # Should extract longest keyword
+        call_kwargs = mock_neo4j_repo.search_by_keyword.call_args.kwargs
+        assert call_kwargs["keyword"] in ["algorithms", "learning", "machine"]
+
+    @pytest.mark.asyncio
+    async def test_graph_search_exception_propagates(
+        self,
+        search_service_with_neo4j: SearchService,
+        mock_neo4j_repo: MagicMock,
+    ) -> None:
+        """Test that exceptions from Neo4j propagate."""
+        mock_neo4j_repo.search_by_keyword.side_effect = Exception("Connection failed")
+
+        with pytest.raises(Exception, match="Connection failed"):
+            await search_service_with_neo4j.graph_search(
+                query="test query",
+                user_id="user1",
+            )
+
+
+class TestGraphSearchByEntity:
+    """Tests for entity-based graph search."""
+
+    @pytest.mark.asyncio
+    async def test_entity_search_success(
+        self,
+        search_service_with_neo4j: SearchService,
+        mock_neo4j_repo: MagicMock,
+    ) -> None:
+        """Test successful entity search."""
+        mock_neo4j_repo.search_by_entity.return_value = [
+            {
+                "chunk_uuid": "c1",
+                "doc_uuid": "doc-1",
+                "matched_entity": "TensorFlow",
+                "path_length": 0,
+            },
+        ]
+
+        results = await search_service_with_neo4j.graph_search_by_entity(
+            entity_name="TensorFlow",
+            user_id="user1",
+        )
+
+        assert len(results) == 1
+        assert results[0].metadata.get("matched_entity") == "TensorFlow"
+
+    @pytest.mark.asyncio
+    async def test_entity_search_no_neo4j_repo(
+        self,
+        search_service: SearchService,
+    ) -> None:
+        """Test entity search without Neo4j repo."""
+        results = await search_service.graph_search_by_entity(
+            entity_name="Test",
+            user_id="user1",
+        )
+
+        assert len(results) == 0
+
+    @pytest.mark.asyncio
+    async def test_entity_search_applies_acl(
+        self,
+        search_service_with_neo4j: SearchService,
+        mock_neo4j_repo: MagicMock,
+        mock_acl_service: MagicMock,
+    ) -> None:
+        """Test that ACL filter is applied to entity search."""
+        mock_neo4j_repo.search_by_entity.return_value = []
+
+        await search_service_with_neo4j.graph_search_by_entity(
+            entity_name="AI",
+            user_id="user1",
+            user_groups=["group1"],
+        )
+
+        mock_acl_service.get_accessible_documents.assert_called_once()
+        call_kwargs = mock_neo4j_repo.search_by_entity.call_args.kwargs
+        assert call_kwargs["doc_uuids"] == ["doc-1", "doc-2"]
+
+
+class TestGraphSearchWithResponse:
+    """Tests for graph search with response wrapper."""
+
+    @pytest.mark.asyncio
+    async def test_returns_search_response(
+        self,
+        search_service_with_neo4j: SearchService,
+        mock_neo4j_repo: MagicMock,
+        sample_graph_hits: list[dict[str, Any]],
+    ) -> None:
+        """Test that SearchResponse is returned."""
+        mock_neo4j_repo.search_by_keyword.return_value = sample_graph_hits[:2]
+
+        response = await search_service_with_neo4j.graph_search_with_response(
+            query="graph query",
+            user_id="user1",
+        )
+
+        assert isinstance(response, SearchResponse)
+        assert response.total == 2
+        assert SearchType.GRAPH in response.search_types_used
+        assert response.search_time_ms >= 0
+
+    @pytest.mark.asyncio
+    async def test_response_includes_graph_type(
+        self,
+        search_service_with_neo4j: SearchService,
+        mock_neo4j_repo: MagicMock,
+    ) -> None:
+        """Test SearchResponse includes GRAPH search type."""
+        mock_neo4j_repo.search_by_keyword.return_value = []
+
+        response = await search_service_with_neo4j.graph_search_with_response(
+            query="test query",
+            user_id="user1",
+        )
+
+        response_dict = response.to_dict()
+        assert response_dict["search_types_used"] == ["graph"]
+
+
+class TestFormatGraphResults:
+    """Tests for graph result formatting."""
+
+    def test_format_graph_results(
+        self,
+        search_service_with_neo4j: SearchService,
+        sample_graph_hits: list[dict[str, Any]],
+    ) -> None:
+        """Test graph result formatting."""
+        results = search_service_with_neo4j._format_graph_results(sample_graph_hits)
+
+        assert len(results) == 3
+        assert results[0].chunk_uuid == "chunk-g1"
+        assert results[0].search_type == "graph"
+        assert results[0].metadata["title"] == "Document 1"
+
+    def test_format_graph_results_scoring(
+        self,
+        search_service_with_neo4j: SearchService,
+    ) -> None:
+        """Test graph result scoring calculation."""
+        hits = [
+            {"chunk_uuid": "c1", "doc_uuid": "d1", "path_length": 0},
+            {"chunk_uuid": "c2", "doc_uuid": "d1", "path_length": 1},
+        ]
+        results = search_service_with_neo4j._format_graph_results(hits)
+
+        # First hit: base_score=1.0, path_penalty=0, final=1.0
+        # Second hit: base_score=0.95, path_penalty=0.1, final=0.85
+        assert results[0].score == 1.0
+        assert results[1].score == 0.85
+
+    def test_format_graph_results_empty(
+        self,
+        search_service_with_neo4j: SearchService,
+    ) -> None:
+        """Test formatting empty results."""
+        results = search_service_with_neo4j._format_graph_results([])
+        assert len(results) == 0
 
 
 # =============================================================================
