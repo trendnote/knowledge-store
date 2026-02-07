@@ -1,14 +1,34 @@
 """Search-related domain models.
 
 This module provides domain models for vector search operations:
+- SearchType: Type of search operation
 - MilvusChunk: Data for Milvus insertion
 - SearchHit: Search result representation
+- SearchRequest: Search request parameters
+- SearchResponse: Search response with results
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
+
+
+class SearchType(str, Enum):
+    """Type of search performed.
+
+    Attributes:
+        DENSE: Semantic similarity search using dense embeddings
+        SPARSE: Keyword matching search using sparse embeddings
+        GRAPH: Graph-based search through Neo4j
+        HYBRID: Combined dense + sparse search with RRF fusion
+    """
+
+    DENSE = "dense"
+    SPARSE = "sparse"
+    GRAPH = "graph"
+    HYBRID = "hybrid"
 
 
 @dataclass
@@ -86,3 +106,75 @@ class SearchHit:
                 "allowed_groups": hit.get("allowed_groups"),
             },
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for API response.
+
+        Returns:
+            Dictionary representation
+        """
+        return {
+            "chunk_uuid": self.chunk_uuid,
+            "doc_uuid": self.doc_uuid,
+            "score": self.score,
+            "distance": self.distance,
+            "chunk_text": self.chunk_text,
+            "section_path": self.section_path,
+            "search_type": self.search_type,
+            "metadata": self.metadata,
+        }
+
+
+@dataclass
+class SearchRequest:
+    """Search request parameters.
+
+    Attributes:
+        query: Search query text
+        user_id: User identifier for ACL
+        user_groups: User's group memberships
+        top_k: Maximum results to return
+        search_types: Types of search to perform
+        min_score: Minimum score threshold
+        include_chunk_text: Whether to include full chunk text
+    """
+
+    query: str
+    user_id: str
+    user_groups: list[str] = field(default_factory=list)
+    top_k: int = 10
+    search_types: list[SearchType] = field(
+        default_factory=lambda: [SearchType.DENSE]
+    )
+    min_score: float = 0.0
+    include_chunk_text: bool = True
+
+
+@dataclass
+class SearchResponse:
+    """Search response with results.
+
+    Attributes:
+        results: List of search hits
+        total: Total number of results
+        search_time_ms: Search execution time in milliseconds
+        search_types_used: Types of search that were executed
+    """
+
+    results: list[SearchHit]
+    total: int
+    search_time_ms: float
+    search_types_used: list[SearchType] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for API response.
+
+        Returns:
+            Dictionary representation
+        """
+        return {
+            "results": [r.to_dict() for r in self.results],
+            "total": self.total,
+            "search_time_ms": self.search_time_ms,
+            "search_types_used": [t.value for t in self.search_types_used],
+        }

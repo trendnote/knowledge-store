@@ -16,7 +16,13 @@ This module exports core domain entities:
 
 from src.domain.document import AclEntry, AuditLog, Chunk, Document, DocumentVersion
 from src.domain.graph import ChunkNode, DocumentNode, Entity, GraphSearchResult
-from src.domain.search import MilvusChunk, SearchHit
+from src.domain.search import (
+    MilvusChunk,
+    SearchHit,
+    SearchRequest,
+    SearchResponse,
+    SearchType,
+)
 
 __all__ = [
     "Document",
@@ -26,6 +32,9 @@ __all__ = [
     "AuditLog",
     "MilvusChunk",
     "SearchHit",
+    "SearchRequest",
+    "SearchResponse",
+    "SearchType",
     "DocumentNode",
     "ChunkNode",
     "Entity",
