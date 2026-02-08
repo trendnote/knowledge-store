@@ -5,7 +5,11 @@ This module exports core domain entities:
 - DocumentVersion: Version history
 - Chunk: Document chunks
 - AclEntry: Access control
-- AuditLog: Audit trail
+- AuditLog: Audit trail (legacy)
+- AuditAction: Audit action types
+- AuditLogEntry: Detailed audit log entry
+- AuditQuery: Audit log query parameters
+- ResourceType: Resource types for audit
 - MilvusChunk: Vector chunk for Milvus
 - SearchHit: Search result
 - DocumentNode: Graph document node
@@ -14,6 +18,12 @@ This module exports core domain entities:
 - GraphSearchResult: Graph search result
 """
 
+from src.domain.audit import (
+    AuditAction,
+    AuditLogEntry,
+    AuditQuery,
+    ResourceType,
+)
 from src.domain.document import AclEntry, AuditLog, Chunk, Document, DocumentVersion
 from src.domain.graph import ChunkNode, DocumentNode, Entity, GraphSearchResult
 from src.domain.search import (
@@ -30,6 +40,10 @@ __all__ = [
     "Chunk",
     "AclEntry",
     "AuditLog",
+    "AuditAction",
+    "AuditLogEntry",
+    "AuditQuery",
+    "ResourceType",
     "MilvusChunk",
     "SearchHit",
     "SearchRequest",

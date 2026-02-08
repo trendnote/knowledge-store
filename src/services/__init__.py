@@ -5,6 +5,7 @@ This module provides business logic services:
 - SearchService: Vector and graph search operations
 - DocumentService: Document CRUD operations
 - SyncService: Event-driven data synchronization
+- AuditService: Audit logging service
 """
 
 from src.services.acl_service import (
@@ -16,6 +17,15 @@ from src.services.acl_service import (
     close_acl_service,
     get_acl_service,
     reset_acl_service,
+)
+from src.services.audit_service import (
+    AuditRepositoryProtocol,
+    AuditService,
+    audit_document,
+    audit_permission,
+    audit_search,
+    get_audit_service,
+    set_audit_service,
 )
 from src.services.document_service import (
     ChunkData,
@@ -51,6 +61,14 @@ __all__ = [
     "close_acl_service",
     "get_acl_service",
     "reset_acl_service",
+    # Audit Service
+    "AuditRepositoryProtocol",
+    "AuditService",
+    "audit_document",
+    "audit_permission",
+    "audit_search",
+    "get_audit_service",
+    "set_audit_service",
     # Document Service
     "ChunkData",
     "DocumentCreateRequest",
